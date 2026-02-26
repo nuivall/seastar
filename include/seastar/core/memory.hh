@@ -303,16 +303,19 @@ class statistics {
     uint64_t _foreign_mallocs;
     uint64_t _foreign_frees;
     uint64_t _foreign_cross_frees;
+    uint64_t _total_bytes_allocated;
 private:
     statistics(uint64_t mallocs, uint64_t frees, uint64_t cross_cpu_frees,
             uint64_t total_memory, uint64_t free_memory, uint64_t reclaims,
             uint64_t large_allocs, uint64_t failed_allocs,
-            uint64_t foreign_mallocs, uint64_t foreign_frees, uint64_t foreign_cross_frees)
+            uint64_t foreign_mallocs, uint64_t foreign_frees, uint64_t foreign_cross_frees,
+            uint64_t total_bytes_allocated)
         : _mallocs(mallocs), _frees(frees), _cross_cpu_frees(cross_cpu_frees)
         , _total_memory(total_memory), _free_memory(free_memory), _reclaims(reclaims)
         , _large_allocs(large_allocs), _failed_allocs(failed_allocs)
         , _foreign_mallocs(foreign_mallocs), _foreign_frees(foreign_frees)
-        , _foreign_cross_frees(foreign_cross_frees) {}
+        , _foreign_cross_frees(foreign_cross_frees)
+        , _total_bytes_allocated(total_bytes_allocated) {}
 public:
     /// Total number of memory allocations calls since the system was started.
     uint64_t mallocs() const { return _mallocs; }
@@ -342,6 +345,8 @@ public:
     uint64_t foreign_frees() const { return _foreign_frees; }
     /// Number of foreign frees on reactor threads
     uint64_t foreign_cross_frees() const { return _foreign_cross_frees; }
+    /// Total number of bytes allocated since the system was started.
+    uint64_t total_bytes_allocated() const { return _total_bytes_allocated; }
     friend statistics stats();
 };
 
