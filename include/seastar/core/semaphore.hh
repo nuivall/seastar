@@ -28,6 +28,7 @@
 #include <seastar/core/timed_out_error.hh>
 #include <seastar/core/abort_on_expiry.hh>
 #include <seastar/util/assert.hh>
+#include <algorithm>
 #include <exception>
 #include <optional>
 #include <stdexcept>
@@ -126,6 +127,37 @@ struct named_semaphore_exception_factory {
     named_semaphore_aborted aborted() const noexcept;
 };
 
+/// \brief An external source of units a semaphore may borrow from.
+///
+/// Lets a group of semaphores each keep a private, guaranteed capacity while
+/// sharing a common pool for bursts: a semaphore consumes its own units first
+/// and only borrows from the source when it runs short.  Borrowed units are
+/// returned as soon as the semaphore's own units cover its consumption again.
+///
+/// Borrowing is opt-in.  A semaphore with no borrow source attached behaves
+/// exactly as it does without this feature; the virtual functions live on the
+/// source, so no vtable is added to \ref basic_semaphore.
+///
+/// The source must outlive every semaphore that borrows from it.
+class semaphore_borrow_source {
+public:
+    virtual ~semaphore_borrow_source() = default;
+    /// Number of units that can be borrowed right now.  Never negative.
+    virtual ssize_t available() const noexcept = 0;
+    /// The largest number of units the source could ever lend, ignoring what is
+    /// lent out at the moment.  Lets a borrower tell "wait, this will come back"
+    /// apart from "this can never be funded".
+    virtual ssize_t lendable_total() const noexcept = 0;
+    /// Take \p n units out of the source.  \p n never exceeds available().
+    virtual void borrow(ssize_t n) noexcept = 0;
+    /// Give \p n previously borrowed units back to the source.
+    virtual void repay(ssize_t n) noexcept = 0;
+    /// Called after repay() so the source can offer the returned units to its
+    /// other borrowers.  The implementation must not re-enter the semaphore
+    /// that is repaying.
+    virtual void on_repaid() noexcept = 0;
+};
+
 /// \brief Counted resource guard.
 ///
 /// This is a standard computer science semaphore, adapted
@@ -154,6 +186,10 @@ public:
     using exception_factory = ExceptionFactory;
 private:
     ssize_t _count;
+    semaphore_borrow_source* _borrow_source = nullptr;
+    ssize_t _borrowed = 0;
+    size_t _capacity;
+    bool _admit_oversized_when_idle = false;
     std::exception_ptr _ex;
     struct entry {
         promise<> pr;
@@ -229,6 +265,76 @@ private:
     bool may_proceed(size_t nr) const noexcept {
         return has_available_units(nr) && _wait_list.empty();
     }
+    // Like has_available_units(), but tops the counter up from the borrow
+    // source when the semaphore's own units fall short.  Units taken from the
+    // source are recorded in _borrowed and handed back by maybe_repay().
+    //
+    // All or nothing: a partial top-up could not admit the waiter anyway and
+    // maybe_repay() would hand it straight back, so the source would be
+    // borrowed from and repaid in a loop.
+    bool has_or_can_borrow_units(size_t nr) noexcept {
+        if (has_available_units(nr)) {
+            return true;
+        }
+        if (_ex || !_borrow_source || nr > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+            return false;
+        }
+        const ssize_t shortfall = static_cast<ssize_t>(nr) - std::max(_count, ssize_t(0));
+        if (_borrow_source->available() < shortfall) {
+            return false;
+        }
+        _borrow_source->borrow(shortfall);
+        _borrowed += shortfall;
+        _count += shortfall;
+        return true;
+    }
+    // True when no units are outstanding, i.e. the counter is back to what the
+    // semaphore holds at rest.  Nothing left to be returned means no future
+    // signal() can raise the counter on its own.
+    bool nothing_outstanding() const noexcept {
+        return _count >= static_cast<ssize_t>(_capacity) + _borrowed;
+    }
+    // Whether the waiter asking for `nr` units may be admitted now.
+    bool can_admit(size_t nr) noexcept {
+        if (has_or_can_borrow_units(nr)) {
+            return true;
+        }
+        if (_ex || !_admit_oversized_when_idle || !nothing_outstanding()) {
+            return false;
+        }
+        // Nothing is outstanding, so only the borrow source can still grow the
+        // counter.  Rescue the waiter only if not even everything the semaphore
+        // could ever reach would cover it - otherwise the units are merely lent
+        // out elsewhere and waiting for them is the right thing to do.
+        if (nr > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+            return true;
+        }
+        const ssize_t reachable = static_cast<ssize_t>(_capacity)
+                + (_borrow_source ? _borrow_source->lendable_total() : 0);
+        return static_cast<ssize_t>(nr) > reachable;
+    }
+    // Return borrowed units that the semaphore's own capacity now covers, so
+    // the source can lend them to another borrower.
+    void maybe_repay() noexcept {
+        if (!_borrow_source || _borrowed <= 0 || _count <= 0) {
+            return;
+        }
+        const ssize_t back = std::min(_borrowed, _count);
+        _borrowed -= back;
+        _count -= back;
+        _borrow_source->repay(back);
+        _borrow_source->on_repaid();
+    }
+    // Waiters ahead of us keep their place: the queue is checked before
+    // borrowing, so a newcomer never barges and we never borrow needlessly.
+    bool may_proceed_or_borrow(size_t nr) noexcept {
+        return _wait_list.empty() && has_or_can_borrow_units(nr);
+    }
+    // As above, but also applies the oversized-when-idle escape, so a caller
+    // prepared to wait is not made to wait for something that can never happen.
+    bool may_admit(size_t nr) noexcept {
+        return _wait_list.empty() && can_admit(nr);
+    }
 public:
     /// Returns the maximum number of units the semaphore counter can hold
     static constexpr size_t max_counter() noexcept {
@@ -243,11 +349,13 @@ public:
     basic_semaphore(size_t count) noexcept(std::is_nothrow_default_constructible_v<exception_factory>)
         : exception_factory()
         , _count(count),
+        _capacity(count),
         _wait_list(expiry_handler{*this})
     {}
     basic_semaphore(size_t count, exception_factory&& factory) noexcept(std::is_nothrow_move_constructible_v<exception_factory>)
         : exception_factory(std::move(factory))
         , _count(count)
+        , _capacity(count)
         , _wait_list(expiry_handler{*this})
     {
         static_assert(std::is_nothrow_move_constructible_v<expiry_handler>);
@@ -261,6 +369,10 @@ public:
     basic_semaphore(basic_semaphore&& other) noexcept(std::is_nothrow_move_constructible_v<exception_factory>)
         : exception_factory(other)
         , _count(other._count)
+        , _borrow_source(std::exchange(other._borrow_source, nullptr))
+        , _borrowed(std::exchange(other._borrowed, 0))
+        , _capacity(other._capacity)
+        , _admit_oversized_when_idle(other._admit_oversized_when_idle)
         , _ex(std::exchange(other._ex, std::exception_ptr()))
         , _wait_list(expiry_handler{*this})
         , _used(std::move(other._used))
@@ -283,6 +395,10 @@ public:
         if (this != &other) {
             exception_factory::operator=(other);
             _count = other._count;
+            _borrow_source = std::exchange(other._borrow_source, nullptr);
+            _borrowed = std::exchange(other._borrowed, 0);
+            _capacity = other._capacity;
+            _admit_oversized_when_idle = other._admit_oversized_when_idle;
             _ex = std::exchange(other._ex, std::exception_ptr());
             _used = std::move(other._used);
         }
@@ -317,7 +433,7 @@ public:
     ///         \ref broken(), may contain a \ref broken_semaphore exception.
     future<> wait(time_point timeout, size_t nr = 1) noexcept {
         _used.use();
-        if (may_proceed(nr)) {
+        if (may_admit(nr)) {
             _count -= nr;
             return make_ready_future<>();
         }
@@ -356,7 +472,7 @@ public:
     ///         \ref broken(), may contain a \ref broken_semaphore exception.
     future<> wait(abort_source& as, size_t nr = 1) noexcept {
         _used.use();
-        if (may_proceed(nr)) {
+        if (may_admit(nr)) {
             _count -= nr;
             return make_ready_future<>();
         }
@@ -407,12 +523,15 @@ public:
             return;
         }
         _count += nr;
-        while (!_wait_list.empty() && has_available_units(_wait_list.front().nr)) {
+        while (!_wait_list.empty() && can_admit(_wait_list.front().nr)) {
             auto& x = _wait_list.front();
             _count -= x.nr;
             x.pr.set_value();
             _wait_list.pop_front();
         }
+        // Whatever is left over is not needed by our own waiters, so do not sit
+        // on the source's units while another borrower may be blocked.
+        maybe_repay();
     }
 
     /// Consume the specific number of units without blocking
@@ -442,7 +561,7 @@ public:
     /// \return `true` if the counter had sufficient units, and was decremented.
     bool try_wait(size_t nr = 1) noexcept {
         _used.use();
-        if (may_proceed(nr)) {
+        if (may_proceed_or_borrow(nr)) {
             _count -= nr;
             return true;
         } else {
@@ -493,9 +612,23 @@ public:
     /// The future is made available immediately.
     void broken(std::exception_ptr ex) noexcept;
 
+    /// Attaches an external source this semaphore may borrow units from when
+    /// its own counter falls short.  Pass nullptr to detach; all borrowed units
+    /// must have been repaid (borrowed() == 0) before detaching.
+    void set_borrow_source(semaphore_borrow_source* source) noexcept {
+        SEASTAR_ASSERT(source || _borrowed == 0);
+        _borrow_source = source;
+    }
+
+    /// Returns the currently attached borrow source, or nullptr.
+    semaphore_borrow_source* borrow_source() const noexcept { return _borrow_source; }
+
+    /// Returns the number of units currently borrowed from the borrow source.
+    ssize_t borrowed() const noexcept { return _borrowed; }
+
     /// Returns the number of units the waiter at the head of the queue is
-    /// waiting for, or 0 if there are no waiters.  Lets the owner of a
-    /// semaphore find out how much a blocked semaphore actually needs.
+    /// waiting for, or 0 if there are no waiters.  Lets a borrow source find
+    /// out how much a blocked semaphore actually needs before lending to it.
     size_t next_waiter_units() const noexcept {
         return _wait_list.empty() ? 0 : _wait_list.front().nr;
     }
@@ -513,7 +646,29 @@ public:
         if (_ex) {
             return;
         }
+        // The capacity cannot go below zero.  Clamp the delta rather than the
+        // result, so that the counter and the capacity stay in step and
+        // nothing_outstanding() keeps telling the truth.
+        delta = std::max(delta, -static_cast<ssize_t>(_capacity));
         _count += delta;
+        _capacity += delta;
+        signal(0);
+    }
+
+    /// Sets the number of units the semaphore holds at rest.
+    void set_capacity(size_t capacity) noexcept {
+        adjust_capacity(static_cast<ssize_t>(capacity) - static_cast<ssize_t>(_capacity));
+    }
+
+    /// Returns the number of units the semaphore holds at rest.
+    size_t capacity() const noexcept { return _capacity; }
+
+    /// Lets the semaphore admit a waiter asking for more units than it can
+    /// reach, once nothing is outstanding, instead of blocking it forever.  The
+    /// counter goes negative and recovers as the units are returned, so at most
+    /// one such waiter is admitted at a time.
+    void set_admit_oversized_when_idle(bool enable) noexcept {
+        _admit_oversized_when_idle = enable;
         signal(0);
     }
 
@@ -530,6 +685,11 @@ basic_semaphore<ExceptionFactory, Clock>::broken(std::exception_ptr xp) noexcept
     static_assert(std::is_nothrow_copy_constructible_v<std::exception_ptr>);
     _ex = xp;
     _count = 0;
+    if (_borrowed > 0 && _borrow_source) {
+        const ssize_t back = std::exchange(_borrowed, 0);
+        _borrow_source->repay(back);
+        _borrow_source->on_repaid();
+    }
     while (!_wait_list.empty()) {
         auto& x = _wait_list.front();
         x.pr.set_exception(xp);
