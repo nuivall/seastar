@@ -493,6 +493,30 @@ public:
     /// The future is made available immediately.
     void broken(std::exception_ptr ex) noexcept;
 
+    /// Returns the number of units the waiter at the head of the queue is
+    /// waiting for, or 0 if there are no waiters.  Lets the owner of a
+    /// semaphore find out how much a blocked semaphore actually needs.
+    size_t next_waiter_units() const noexcept {
+        return _wait_list.empty() ? 0 : _wait_list.front().nr;
+    }
+
+    /// Changes the number of units the counter holds by \p delta, then
+    /// re-evaluates the wait queue.
+    ///
+    /// This is for resizing a semaphore's capacity, as opposed to \ref signal()
+    /// and \ref consume() which hand units back and forth.  A negative delta
+    /// may drive the counter negative; units returned later restore it.
+    /// Because waiters are re-evaluated against the current counter, shrinking
+    /// never leaves a satisfiable waiter parked, and growing admits whoever now
+    /// fits.
+    void adjust_capacity(ssize_t delta) noexcept {
+        if (_ex) {
+            return;
+        }
+        _count += delta;
+        signal(0);
+    }
+
     /// Reserve memory for waiters so that wait() will not throw.
     void ensure_space_for_waiters(size_t n) {
         _wait_list.reserve(n);
