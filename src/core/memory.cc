@@ -442,6 +442,7 @@ public:
     inline void* try_allocate();
     void deallocate(void* object);
     unsigned object_size() const { return _object_size; }
+    free_object* free_list_head() const { return _free; }
     /// See _sampled_pool
     bool is_sampled_pool() const {
 #ifdef SEASTAR_HEAPPROF
@@ -2070,6 +2071,41 @@ memory_layout get_memory_layout() {
     return cpu_mem.memory_layout();
 }
 
+namespace internal {
+
+page_map get_page_map() noexcept {
+    return page_map{
+        .memory = reinterpret_cast<uintptr_t>(cpu_mem.memory),
+        .nr_pages = cpu_mem.nr_pages,
+        .descriptors = reinterpret_cast<uintptr_t>(cpu_mem.pages),
+        .descriptor_size = sizeof(page),
+        .arena_start = reinterpret_cast<uintptr_t>(mem_base()),
+        .arena_end = reinterpret_cast<uintptr_t>(mem_base()) + mem_base_alloc,
+    };
+}
+
+page_info decode_page_descriptor(const void* descriptor) noexcept {
+    page p;
+    std::memcpy(static_cast<void*>(&p), descriptor, sizeof(p));
+    return page_info{
+        .free = p.free,
+        .span_size = p.span_size,
+        .small_object_size = p.pool ? p.pool->object_size() : 0,
+        .offset_in_span = p.offset_in_span,
+        .freelist = reinterpret_cast<uintptr_t>(p.freelist),
+    };
+}
+
+void for_each_detached_free_list(void (*func)(uintptr_t head, void* arg), void* arg) noexcept {
+    for (unsigned i = 0; i < small_pool_array<false>::nr_small_pools; ++i) {
+        func(reinterpret_cast<uintptr_t>(cpu_mem.small_pools[i].free_list_head()), arg);
+        func(reinterpret_cast<uintptr_t>(cpu_mem.sampled_small_pools[i].free_list_head()), arg);
+    }
+    func(reinterpret_cast<uintptr_t>(cpu_mem.xcpu_freelist.load(std::memory_order_acquire)), arg);
+}
+
+}
+
 size_t min_free_memory() {
     return cpu_mem.min_free_pages * page_size;
 }
@@ -2845,6 +2881,21 @@ bool drain_cross_cpu_freelist() {
 
 memory_layout get_memory_layout() {
     throw std::runtime_error("get_memory_layout() not supported");
+}
+
+namespace internal {
+
+page_map get_page_map() noexcept {
+    return page_map{};
+}
+
+page_info decode_page_descriptor(const void*) noexcept {
+    return page_info{};
+}
+
+void for_each_detached_free_list(void (*)(uintptr_t, void*), void*) noexcept {
+}
+
 }
 
 size_t min_free_memory() {

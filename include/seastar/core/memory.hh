@@ -358,6 +358,49 @@ struct memory_layout {
 // Supported only when seastar allocator is enabled.
 memory::memory_layout get_memory_layout();
 
+/// \cond internal
+namespace internal {
+
+// Allocator introspection, used to write consistent snapshots of a shard's
+// memory (e.g. minidumps). Supported only when the seastar allocator is enabled.
+
+/// Where the calling shard keeps its page descriptors.
+struct page_map {
+    uintptr_t memory;        ///< address of page 0 of the shard
+    size_t nr_pages;         ///< number of pages, and of descriptors
+    uintptr_t descriptors;   ///< address of the descriptor array; it lives inside the shard's memory
+    size_t descriptor_size;  ///< size of one descriptor in bytes
+    uintptr_t arena_start;   ///< start of the range reserved for the allocator (all shards and threads)
+    uintptr_t arena_end;     ///< end of that range
+};
+
+/// Returns the page map of the calling shard.
+page_map get_page_map() noexcept;
+
+/// What a page descriptor says about its page.
+struct page_info {
+    bool free;                   ///< the page belongs to a free span
+    uint32_t span_size;          ///< span length in pages; meaningful on the first page of a span
+    unsigned small_object_size;  ///< object size if the page belongs to a small-object pool, else 0
+    uint8_t offset_in_span;      ///< position of the page in its small-object span
+    uintptr_t freelist;          ///< first free object of a small-object span (first page only)
+};
+
+/// Decodes a page descriptor. \c descriptor may point to a copy of the
+/// descriptor; the pool it refers to is read in place (its object size
+/// never changes).
+page_info decode_page_descriptor(const void* descriptor) noexcept;
+
+/// Calls \c func with the head of every list of free objects which is not
+/// attached to a page: the small-object pools' own lists, and the objects
+/// freed by other shards which this shard has not reclaimed yet. Every object
+/// on such a list keeps the address of the next one in its first word.
+/// Must be called on the shard owning the lists. Does not allocate.
+void for_each_detached_free_list(void (*func)(uintptr_t head, void* arg), void* arg) noexcept;
+
+}
+/// \endcond
+
 /// Returns the size of free memory in bytes.
 size_t free_memory();
 
